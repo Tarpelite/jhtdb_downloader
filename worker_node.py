@@ -29,7 +29,7 @@ def download_chunk(task: Dict):
         time.sleep(random.uniform(0, 0.1))
         
         result = client.service.GetAnyCutoutWeb(
-            "your-token",  # 这里需要从外部传入token
+            "cn.edu.pku.shanghang-22b6171a",  # 这里需要从外部传入token
             "mhd1024",
             task['field'],
             task['timestep'],
