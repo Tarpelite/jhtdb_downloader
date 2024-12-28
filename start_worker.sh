@@ -15,6 +15,13 @@ source /root/miniconda3/bin/activate
 # 安装依赖
 pip3 install -r requirements.txt
 
+#配置obsutil相关
+wget https://obs-community.obs.cn-north-1.myhuaweicloud.com/obsutil/current/obsutil_linux_amd64.tar.gz
+tar -xzvf obsutil_linux_amd64.tar.gz
+chmod 755 obsutil_linux_amd64_5.5.12/obsutil
+export PATH=$PATH:/root/jhtdb_downloader/obsutil_linux_amd64_5.5.12/
+
+
 # 启动worker
 python worker_node.py \
     --worker-id $WORKER_ID \
@@ -22,7 +29,7 @@ python worker_node.py \
     --master-url "http://$MASTER_IP:5000" \
     --redis-host $MASTER_IP \
     --redis-port 6379 \
-    --token "your-token-here" \
-    --obs-bucket "obsobs" \
+    --token "cn.edu.pku.shanghang-22b6171a" \
+    --obs-bucket "jhtdb" \
     --max-workers 16
 
