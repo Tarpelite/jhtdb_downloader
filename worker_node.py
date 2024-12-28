@@ -174,8 +174,8 @@ class JHTDBWorker:
                                 tasks.append(task)
         
         return tasks
-
-     def run(self):
+    
+    def run(self):
         """运行worker"""
         # 启动心跳线程
         import threading
