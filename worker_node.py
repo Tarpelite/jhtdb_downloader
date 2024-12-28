@@ -18,6 +18,53 @@ import random
 from pathlib import Path
 from tqdm import tqdm
 
+
+def download_chunk(task: Dict):
+    """下载单个数据块"""
+    try:
+        # 在每个进程中创建新的client
+        client = zeep.Client('http://turbulence.pha.jhu.edu/service/turbulence.asmx?WSDL')
+        
+        # 添加随机延迟避免同时请求
+        time.sleep(random.uniform(0, 0.1))
+        
+        result = client.service.GetAnyCutoutWeb(
+            "your-token",  # 这里需要从外部传入token
+            "mhd1024",
+            task['field'],
+            task['timestep'],
+            task['x_start'], task['y_start'], task['z_start'],
+            task['x_end'], task['y_end'], task['z_end'],
+            task['x_step'], task['y_step'], task['z_step'],
+            0, ""
+        )
+        
+        # 解析数据
+        c = 1 if task['field'] == 'p' else 3
+        base64_len = int(512 * 512 * 2 * c)
+        base64_format = '<' + str(base64_len) + 'f'
+        data = struct.unpack(base64_format, result)
+        data = np.array(data).reshape((512, 512, 2, c))
+        
+        # 保存到临时文件系统
+        save_name = f"f_{task['field']}_t_{task['timestep']}_z_{task['z_start']}.npy"
+        local_path = f'/mnt/tmpfs/{save_name}'
+        np.save(local_path, data)
+        
+        # 上传到OBS
+        remote_path = f"obs://your-bucket/mhd1024/worker_{task['worker_id']}/{save_name}"
+        os.system(f"./obsutil cp {local_path} {remote_path} >log.txt 2>&1")
+        
+        # 清理临时文件
+        os.remove(local_path)
+        
+        return True
+        
+    except Exception as e:
+        logging.error(f"Error in download_chunk: {str(e)}")
+        return False
+
+
 @dataclass
 class WorkerConfig:
     """Worker配置类"""
@@ -87,51 +134,6 @@ class JHTDBWorker:
             )
         except Exception as e:
             logging.error(f"Failed to update progress: {e}")
-
-    def download_chunk(task: Dict):
-        """下载单个数据块"""
-        try:
-            # 在每个进程中创建新的client
-            client = zeep.Client('http://turbulence.pha.jhu.edu/service/turbulence.asmx?WSDL')
-            
-            # 添加随机延迟避免同时请求
-            time.sleep(random.uniform(0, 0.1))
-            
-            result = client.service.GetAnyCutoutWeb(
-                "your-token",  # 这里需要从外部传入token
-                "mhd1024",
-                task['field'],
-                task['timestep'],
-                task['x_start'], task['y_start'], task['z_start'],
-                task['x_end'], task['y_end'], task['z_end'],
-                task['x_step'], task['y_step'], task['z_step'],
-                0, ""
-            )
-            
-            # 解析数据
-            c = 1 if task['field'] == 'p' else 3
-            base64_len = int(512 * 512 * 2 * c)
-            base64_format = '<' + str(base64_len) + 'f'
-            data = struct.unpack(base64_format, result)
-            data = np.array(data).reshape((512, 512, 2, c))
-            
-            # 保存到临时文件系统
-            save_name = f"f_{task['field']}_t_{task['timestep']}_z_{task['z_start']}.npy"
-            local_path = f'/mnt/tmpfs/{save_name}'
-            np.save(local_path, data)
-            
-            # 上传到OBS
-            remote_path = f"obs://your-bucket/mhd1024/worker_{task['worker_id']}/{save_name}"
-            os.system(f"./obsutil cp {local_path} {remote_path} >log.txt 2>&1")
-            
-            # 清理临时文件
-            os.remove(local_path)
-            
-            return True
-            
-        except Exception as e:
-            logging.error(f"Error in download_chunk: {str(e)}")
-            return False
             
     def upload_to_obs(self, local_path: str, remote_path: str):
         """上传文件到OBS"""
