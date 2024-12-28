@@ -53,7 +53,7 @@ def download_chunk(task: Dict):
         
         # 上传到OBS
         remote_path = f"obs://jhtdb/worker_{task['worker_id']}/{save_name}"
-        os.system(f"./obsutil cp {local_path} {remote_path} >log.txt 2>&1")
+        os.system(f"obsutil cp {local_path} {remote_path} >log.txt 2>&1")
         
         # 清理临时文件
         os.remove(local_path)
