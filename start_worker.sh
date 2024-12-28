@@ -1,7 +1,7 @@
 #!/bin/bash
 # start_worker.sh
 WORKER_ID=$1
-MASTER_IP="94.74.65.162"
+MASTER_IP="192.168.0.162"
 
 # 创建并挂载tmpfs
 mkdir -p /mnt/tmpfs
