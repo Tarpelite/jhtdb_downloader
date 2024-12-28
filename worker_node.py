@@ -1,3 +1,4 @@
+import concurrent.futures
 import os
 import json
 import time
@@ -38,7 +39,6 @@ class JHTDBWorker:
     def __init__(self, config: WorkerConfig):
         self.config = config
         self.setup_logging()
-        self.client = None
         self.redis_client = redis.Redis(
             host=config.redis_host,
             port=config.redis_port,
@@ -88,18 +88,18 @@ class JHTDBWorker:
         except Exception as e:
             logging.error(f"Failed to update progress: {e}")
 
-    def download_chunk(self, task: Dict):
+    def download_chunk(task: Dict):
         """下载单个数据块"""
         try:
+            # 在每个进程中创建新的client
+            client = zeep.Client('http://turbulence.pha.jhu.edu/service/turbulence.asmx?WSDL')
+            
             # 添加随机延迟避免同时请求
-            time.sleep(random.uniform(0, self.config.rate_limit_sleep))
+            time.sleep(random.uniform(0, 0.1))
             
-            if not self.client:
-                self.client = zeep.Client('http://turbulence.pha.jhu.edu/service/turbulence.asmx?WSDL')
-            
-            result = self.client.service.GetAnyCutoutWeb(
-                self.config.token,
-                self.config.dataset_name,
+            result = client.service.GetAnyCutoutWeb(
+                "your-token",  # 这里需要从外部传入token
+                "mhd1024",
                 task['field'],
                 task['timestep'],
                 task['x_start'], task['y_start'], task['z_start'],
@@ -117,12 +117,12 @@ class JHTDBWorker:
             
             # 保存到临时文件系统
             save_name = f"f_{task['field']}_t_{task['timestep']}_z_{task['z_start']}.npy"
-            local_path = f'{self.config.tmpfs_path}/{save_name}'
+            local_path = f'/mnt/tmpfs/{save_name}'
             np.save(local_path, data)
             
             # 上传到OBS
-            remote_path = f"{self.config.obs_bucket}/{self.config.dataset_name}/{self.config.worker_id}/{save_name}"
-            self.upload_to_obs(local_path, remote_path)
+            remote_path = f"obs://your-bucket/mhd1024/worker_{task['worker_id']}/{save_name}"
+            os.system(f"./obsutil cp {local_path} {remote_path} >log.txt 2>&1")
             
             # 清理临时文件
             os.remove(local_path)
@@ -175,18 +175,18 @@ class JHTDBWorker:
         
         return tasks
 
-    def run(self):
+     def run(self):
         """运行worker"""
         # 启动心跳线程
         import threading
         heartbeat_thread = threading.Thread(target=self.send_heartbeat, daemon=True)
         heartbeat_thread.start()
         
-        # 初始化SOAP客户端
-        self.client = zeep.Client('http://turbulence.pha.jhu.edu/service/turbulence.asmx?WSDL')
-        
         # 生成任务列表
         tasks = self.generate_tasks()
+        for task in tasks:
+            task['worker_id'] = self.config.worker_id  # 添加worker_id到任务中
+            
         random.shuffle(tasks)  # 随机化任务顺序
         
         completed_tasks = 0
@@ -196,8 +196,7 @@ class JHTDBWorker:
             futures = []
             with tqdm(total=len(tasks)) as pbar:
                 for task in tasks:
-                    future = executor.submit(self.download_chunk, task)
-                    futures.append(future)
+                    futures.append(executor.submit(download_chunk, task))
                     
                 for future in concurrent.futures.as_completed(futures):
                     try:
@@ -220,7 +219,7 @@ class JHTDBWorker:
             retry_tasks = []
             for task in failed_tasks:
                 for _ in range(self.config.retry_limit):
-                    if self.download_chunk(task):
+                    if download_chunk(task):
                         completed_tasks += 1
                         self.update_progress(completed_tasks)
                         break
