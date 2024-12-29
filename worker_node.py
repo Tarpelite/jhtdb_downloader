@@ -153,9 +153,10 @@ class JHTDBWorker:
         tasks = []
         worker_id = self.config.worker_id
         total_workers = self.config.total_workers
+        downsample_rate = 8 # for downsample timestep t
         
-        for t in range(0, 1024, 8):  # 时间步长
-            if t % total_workers == (worker_id - 1):  # 按worker_id分配时间步长
+        for t in range(0, 1024, downsample_rate):  # 时间步长
+            if (t//downsample_rate) % total_workers == (worker_id - 1):  # 按worker_id分配时间步长
                 for field in ['u', 'a', 'b', 'p']:
                     for z in range(0, 1024, 2):
                         for x in range(0, 1024, 512):
