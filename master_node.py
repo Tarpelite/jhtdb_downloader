@@ -59,8 +59,8 @@ class DownloadMaster:
         x_blocks = 1024 // 512  # 2
         y_blocks = 1024 // 512  # 2
         z_blocks = 1024 // 2    # 512
-        timesteps = 1024
-        fields = 7  # u(3) + b(3) + p(1)
+        timesteps = 1024 // 8 # 128
+        fields = 4  # u(3) + b(3) + p(1)
         return x_blocks * y_blocks * z_blocks * timesteps * fields
 
     def check_worker_status(self):
@@ -138,7 +138,7 @@ if __name__ == "__main__":
     config = MasterConfig(
         redis_host='localhost',
         redis_port=6379,
-        total_workers=10
+        total_workers=6
     )
     
     master = DownloadMaster(config)

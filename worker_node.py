@@ -70,7 +70,7 @@ class WorkerConfig:
     """Worker配置类"""
     dataset_name: str = "mhd1024"
     worker_id: int = 1
-    total_workers: int = 10
+    total_workers: int = 6
     token: str = "your-token"
     max_workers: int = 48  # 每个节点的并发数
     retry_limit: int = 3
@@ -154,7 +154,7 @@ class JHTDBWorker:
         worker_id = self.config.worker_id
         total_workers = self.config.total_workers
         
-        for t in range(1024):  # 时间步长
+        for t in range(0, 1024, 8):  # 时间步长
             if t % total_workers == (worker_id - 1):  # 按worker_id分配时间步长
                 for field in ['u', 'a', 'b', 'p']:
                     for z in range(0, 1024, 2):
