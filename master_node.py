@@ -30,6 +30,7 @@ class DownloadMaster:
             decode_responses=True
         )
         self.setup_logging()
+        self.total_tasks = self.calculate_total_tasks()
         
     def setup_logging(self):
         """配置日志系统"""
@@ -44,7 +45,7 @@ class DownloadMaster:
 
     def initialize_progress_tracking(self):
         """初始化进度追踪"""
-        total_tasks = self.calculate_total_tasks()
+        total_tasks = self.total_tasks
         self.redis_client.set('total_tasks', total_tasks)
         self.redis_client.set('completed_tasks', 0)
         
