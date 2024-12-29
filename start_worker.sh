@@ -25,7 +25,7 @@ export PATH=$PATH:/root/jhtdb_downloader/obsutil_linux_amd64_5.5.12/
 # 启动worker
 python worker_node.py \
     --worker-id $WORKER_ID \
-    --total-workers 6 \
+    --total-workers 8 \
     --master-url "http://$MASTER_IP:5000" \
     --redis-host $MASTER_IP \
     --redis-port 6379 \
