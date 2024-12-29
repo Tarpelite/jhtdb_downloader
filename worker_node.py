@@ -47,7 +47,7 @@ def download_chunk(task: Dict):
         data = np.array(data).reshape((512, 512, 2, c))
         
         # 保存到临时文件系统
-        save_name = f"f_{task['field']}_t_{task['timestep']}_z_{task['z_start']}.npy"
+        save_name = f"f_{task['field']}_t_{task['timestep']}_x_{task['x_start']}_y_{task['y_start']}_z_{task['z_start']}.npy"
         local_path = f'/mnt/tmpfs/{save_name}'
         np.save(local_path, data)
         
