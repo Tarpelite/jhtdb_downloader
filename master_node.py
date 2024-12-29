@@ -45,15 +45,22 @@ class DownloadMaster:
 
     def initialize_progress_tracking(self):
         """初始化进度追踪"""
-        total_tasks = self.total_tasks
-        self.redis_client.set('total_tasks', total_tasks)
-        self.redis_client.set('completed_tasks', 0)
-        
-        # 初始化每个worker的状态
-        for worker_id in range(1, self.config.total_workers + 1):
-            self.redis_client.hset('worker_status', f'worker_{worker_id}', 'offline')
-            self.redis_client.hset('worker_progress', f'worker_{worker_id}', '0')
-            self.redis_client.hset('worker_last_heartbeat', f'worker_{worker_id}', str(int(time.time())))
+        try:
+            # 使用Redis事务确保原子性
+            pipe = self.redis_client.pipeline()
+            pipe.set('total_tasks', self.total_tasks)
+            pipe.set('completed_tasks', 0)
+            
+            # 初始化每个worker的状态
+            for worker_id in range(1, self.config.total_workers + 1):
+                pipe.hset('worker_status', f'worker_{worker_id}', 'offline')
+                pipe.hset('worker_progress', f'worker_{worker_id}', '0')
+                pipe.hset('worker_last_heartbeat', f'worker_{worker_id}', str(int(time.time())))
+            
+            pipe.execute()
+        except Exception as e:
+            logging.error(f"Failed to initialize progress tracking: {e}")
+            raise
 
     def calculate_total_tasks(self) -> int:
         """计算总任务数"""
