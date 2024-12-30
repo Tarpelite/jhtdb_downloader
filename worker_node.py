@@ -19,50 +19,191 @@ from pathlib import Path
 from tqdm import tqdm
 
 
-def download_chunk(task: Dict):
-    """下载单个数据块"""
+def check_completed_tasks(worker_id: int, downsample_rate: int = 8):
+    """检查OBS上已经完成的任务"""
+    completed_tasks = set()
+    
+    # 列出该worker目录下的所有文件
+    cmd = f"obsutil ls obs://mhd1024t128/worker_{worker_id}/ -limit=131072 >obs_files.txt 2>&1"
+    os.system(cmd)
+    
     try:
-        # 在每个进程中创建新的client
-        client = zeep.Client('http://turbulence.pha.jhu.edu/service/turbulence.asmx?WSDL')
-        
-        # 添加随机延迟避免同时请求
-        time.sleep(random.uniform(0, 0.1))
-        
-        result = client.service.GetAnyCutoutWeb(
-            "cn.edu.pku.shanghang-22b6171a",  # 这里需要从外部传入token
-            "mhd1024",
-            task['field'],
-            task['timestep'],
-            task['x_start'], task['y_start'], task['z_start'],
-            task['x_end'], task['y_end'], task['z_end'],
-            task['x_step'], task['y_step'], task['z_step'],
-            0, ""
-        )
-        
-        # 解析数据
-        c = 1 if task['field'] == 'p' else 3
-        base64_len = int(512 * 512 * 2 * c)
-        base64_format = '<' + str(base64_len) + 'f'
-        data = struct.unpack(base64_format, result)
-        data = np.array(data).reshape((512, 512, 2, c))
-        
-        # 保存到临时文件系统
-        save_name = f"f_{task['field']}_t_{task['timestep']}_x_{task['x_start']}_y_{task['y_start']}_z_{task['z_start']}.npy"
-        local_path = f'/mnt/tmpfs/{save_name}'
-        np.save(local_path, data)
-        
-        # 上传到OBS
-        remote_path = f"obs://mhd1024t128/worker_{task['worker_id']}/{save_name}"
-        os.system(f"obsutil cp {local_path} {remote_path} >log.txt 2>&1")
-        
-        # 清理临时文件
-        os.remove(local_path)
-        
-        return True
-        
+        with open('obs_files.txt', 'r') as f:
+            lines = f.readlines()
+            
+        for line in lines:
+            if line.strip().endswith('.npy'):
+                # 从文件名解析任务信息
+                filename = line.strip().split('/')[-1]
+                # f_{field}_t_{timestep}_x_{x_start}_y_{y_start}_z_{z_start}.npy
+                parts = filename.replace('.npy', '').split('_')
+                field = parts[1]
+                timestep = int(parts[3])
+                x_start = int(parts[5])
+                y_start = int(parts[7])
+                z_start = int(parts[9])
+                
+                # 创建任务标识符
+                task_id = f"{field}_{timestep}_{x_start}_{y_start}_{z_start}"
+                completed_tasks.add(task_id)
+                
     except Exception as e:
-        logging.error(f"Error in download_chunk: {str(e)}")
-        return False
+        logging.error(f"Error reading OBS file list: {e}")
+    finally:
+        try:
+            os.remove('obs_files.txt')
+        except:
+            pass
+            
+    return completed_tasks
+
+def is_task_completed(task: Dict, completed_tasks: set) -> bool:
+    """检查特定任务是否已完成"""
+    task_id = f"{task['field']}_{task['timestep']}_{task['x_start']}_{task['y_start']}_{task['z_start']}"
+    return task_id in completed_tasks
+
+class AdaptiveRateControl:
+    def __init__(self):
+        self.error_window = []
+        self.window_size = 60  # 60秒的窗口
+        self.error_threshold = 5  # 窗口内错误数阈值
+        self.base_delay = 0.1  # 基础延迟
+        self.max_delay = 5.0  # 最大延迟
+        self.current_delay = self.base_delay
+        self.lock = threading.Lock()
+        self.consecutive_errors = 0
+        self.max_consecutive_errors = 3
+
+    def record_error(self):
+        """记录错误并调整延迟"""
+        current_time = time.time()
+        with self.lock:
+            self.consecutive_errors += 1
+            self.error_window = [t for t in self.error_window 
+                               if current_time - t < self.window_size]
+            self.error_window.append(current_time)
+            
+            if len(self.error_window) > self.error_threshold or \
+               self.consecutive_errors >= self.max_consecutive_errors:
+                self.current_delay = min(self.current_delay * 1.5, self.max_delay)
+                logging.info(f"Increasing delay to {self.current_delay:.2f}s due to errors")
+
+    def record_success(self):
+        """记录成功并逐渐恢复"""
+        with self.lock:
+            self.consecutive_errors = 0
+            if not self.error_window:  # 只有在没有最近错误时才减小延迟
+                self.current_delay = max(
+                    self.base_delay,
+                    self.current_delay * 0.95
+                )
+
+    def get_delay(self):
+        """获取当前延迟时间"""
+        return self.current_delay
+
+class AdaptiveWorkerControl:
+    def __init__(self, initial_workers: int, max_workers: int):
+        self.current_workers = initial_workers
+        self.max_workers = max_workers
+        self.min_workers = 4
+        self.success_streak = 0
+        self.error_streak = 0
+        self.lock = threading.Lock()
+
+    def adjust_workers(self, success: bool):
+        """根据成功/失败调整worker数量"""
+        with self.lock:
+            if success:
+                self.success_streak += 1
+                self.error_streak = 0
+                if self.success_streak >= 10:  # 连续10次成功后增加worker
+                    self.current_workers = min(
+                        self.current_workers + 1,
+                        self.max_workers
+                    )
+                    self.success_streak = 0
+            else:
+                self.error_streak += 1
+                self.success_streak = 0
+                if self.error_streak >= 2:  # 连续2次错误后减少worker
+                    self.current_workers = max(
+                        self.current_workers - 2,
+                        self.min_workers
+                    )
+                    self.error_streak = 0
+            
+            return self.current_workers
+
+
+def download_chunk(task: Dict, rate_control: AdaptiveRateControl):
+    """下载单个数据块"""
+    retry_count = 0
+    max_retries = 3
+    
+    while retry_count < max_retries:
+        try:
+            # 应用动态延迟
+            delay = rate_control.get_delay()
+            time.sleep(delay)
+            
+            # 在每个进程中创建新的client
+            client = zeep.Client(
+                'http://turbulence.pha.jhu.edu/service/turbulence.asmx?WSDL',
+                transport=zeep.Transport(timeout=30)  # 增加超时时间
+            )
+            
+            result = client.service.GetAnyCutoutWeb(
+                "cn.edu.pku.shanghang-22b6171a",
+                "mhd1024",
+                task['field'],
+                task['timestep'],
+                task['x_start'], task['y_start'], task['z_start'],
+                task['x_end'], task['y_end'], task['z_end'],
+                task['x_step'], task['y_step'], task['z_step'],
+                0, ""
+            )
+            
+            # 处理数据
+            c = 1 if task['field'] == 'p' else 3
+            base64_len = int(512 * 512 * 2 * c)
+            base64_format = '<' + str(base64_len) + 'f'
+            data = struct.unpack(base64_format, result)
+            data = np.array(data).reshape((512, 512, 2, c))
+            
+            # 保存到临时文件系统
+            save_name = f"f_{task['field']}_t_{task['timestep']}_x_{task['x_start']}_y_{task['y_start']}_z_{task['z_start']}.npy"
+            local_path = f'/mnt/tmpfs/{save_name}'
+            np.save(local_path, data)
+            
+            # 上传到OBS
+            remote_path = f"obs://mhd1024t128/worker_{task['worker_id']}/{save_name}"
+            os.system(f"obsutil cp {local_path} {remote_path} >log.txt 2>&1")
+            
+            # 清理临时文件
+            os.remove(local_path)
+            
+            # 记录成功
+            rate_control.record_success()
+            return True
+            
+        except Exception as e:
+            retry_count += 1
+            rate_control.record_error()
+            
+            # 计算退避时间
+            backoff_time = min(300, (2 ** retry_count) + random.uniform(0, 1))
+            
+            logging.error(
+                f"Error in download_chunk (attempt {retry_count}/{max_retries}): {str(e)}\n"
+                f"Retrying in {backoff_time:.2f} seconds..."
+            )
+            
+            time.sleep(backoff_time)
+            
+    return False
+
+
 
 
 @dataclass
@@ -182,61 +323,73 @@ class JHTDBWorker:
     def run(self):
         """运行worker"""
         # 启动心跳线程
-        import threading
         heartbeat_thread = threading.Thread(target=self.send_heartbeat, daemon=True)
         heartbeat_thread.start()
         
-        # 生成任务列表
+        # 检查已完成的任务
+        completed_tasks = check_completed_tasks(self.config.worker_id)
+        logging.info(f"Found {len(completed_tasks)} completed tasks")
+        
+        # 生成任务列表并过滤掉已完成的任务
         tasks = self.generate_tasks()
-        for task in tasks:
-            task['worker_id'] = self.config.worker_id  # 添加worker_id到任务中
-            
+        tasks = [task for task in tasks 
+                if not is_task_completed(task, completed_tasks)]
+        
+        logging.info(f"Remaining tasks: {len(tasks)}")
         random.shuffle(tasks)  # 随机化任务顺序
+        
+        # 初始化控制器
+        rate_control = AdaptiveRateControl()
+        worker_control = AdaptiveWorkerControl(
+            initial_workers=8,  # 从较小的值开始
+            max_workers=self.config.max_workers
+        )
         
         completed_tasks = 0
         failed_tasks = []
         
-        with ProcessPoolExecutor(max_workers=self.config.max_workers) as executor:
-            futures = []
-            with tqdm(total=len(tasks)) as pbar:
-                for task in tasks:
-                    futures.append(executor.submit(download_chunk, task))
+        while tasks:
+            current_workers = worker_control.current_workers
+            current_batch = tasks[:current_workers]
+            tasks = tasks[current_workers:]
+            
+            with ProcessPoolExecutor(max_workers=current_workers) as executor:
+                futures = []
+                with tqdm(total=len(current_batch)) as pbar:
+                    for task in current_batch:
+                        futures.append(executor.submit(
+                            download_chunk,
+                            task,
+                            rate_control
+                        ))
                     
-                for future in concurrent.futures.as_completed(futures):
-                    try:
-                        success = future.result()
-                        if success:
-                            completed_tasks += 1
-                            self.update_progress(completed_tasks)
-                        else:
+                    for future in concurrent.futures.as_completed(futures):
+                        try:
+                            success = future.result()
+                            if success:
+                                completed_tasks += 1
+                                self.update_progress(completed_tasks)
+                                worker_control.adjust_workers(True)
+                            else:
+                                failed_tasks.append(task)
+                                worker_control.adjust_workers(False)
+                        except Exception as e:
+                            logging.error(f"Task failed with error: {e}")
                             failed_tasks.append(task)
-                    except Exception as e:
-                        logging.error(f"Task failed with error: {e}")
-                        failed_tasks.append(task)
-                    finally:
-                        pbar.update(1)
-                        pbar.set_description(f"Progress: {completed_tasks}/{len(tasks)}")
-
+                            worker_control.adjust_workers(False)
+                        finally:
+                            pbar.update(1)
+                            pbar.set_description(
+                                f"Progress: {completed_tasks}/{len(tasks)} "
+                                f"Workers: {current_workers}"
+                            )
+            
+            # 每批次后短暂暂停
+            time.sleep(1)
+        
         # 处理失败的任务
         if failed_tasks:
-            logging.info(f"Retrying {len(failed_tasks)} failed tasks...")
-            retry_tasks = []
-            for task in failed_tasks:
-                for _ in range(self.config.retry_limit):
-                    if download_chunk(task):
-                        completed_tasks += 1
-                        self.update_progress(completed_tasks)
-                        break
-                    time.sleep(2)  # 重试前等待
-                else:
-                    retry_tasks.append(task)
-            
-            if retry_tasks:
-                logging.error(f"Failed to download {len(retry_tasks)} tasks after all retries")
-                # 保存失败的任务列表以便后续处理
-                failed_tasks_file = f"failed_tasks_worker_{self.config.worker_id}.json"
-                with open(failed_tasks_file, 'w') as f:
-                    json.dump(retry_tasks, f)
+            self.handle_failed_tasks(failed_tasks)
 
     def cleanup(self):
         """清理临时文件和资源"""
