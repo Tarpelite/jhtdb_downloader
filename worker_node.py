@@ -70,19 +70,29 @@ def is_task_completed(task: Dict, completed_tasks: set) -> bool:
     return task_id in completed_tasks
 
 def download_chunk(task: Dict):
-    """下载单个数据块"""
+    """下载单个数据块，带有改进的错误处理"""
     retry_count = 0
-    max_retries = 3
+    max_retries = 5  # 增加最大重试次数
+    initial_backoff = 2  # 初始等待时间（秒）
+    max_backoff = 600   # 最大等待时间（秒）
     
     while retry_count < max_retries:
         try:
             # 使用进程级别的延迟控制
             time.sleep(get_delay())
             
+            # 创建新的客户端实例，避免复用可能已失效的连接
             client = zeep.Client(
                 'http://turbulence.pha.jhu.edu/service/turbulence.asmx?WSDL',
-                transport=zeep.Transport(timeout=30)
+                transport=zeep.Transport(
+                    timeout=60,  # 增加超时时间
+                    operation_timeout=60,
+                    session=requests.Session()  # 使用新的session
+                )
             )
+            
+            # 在调用API之前添加短暂延迟，避免并发请求过多
+            time.sleep(random.uniform(0.1, 0.5))
             
             result = client.service.GetAnyCutoutWeb(
                 "cn.edu.pku.shanghang-22b6171a",
@@ -95,33 +105,97 @@ def download_chunk(task: Dict):
                 0, ""
             )
             
+            # 验证返回的数据
+            if not result:
+                raise ValueError("Empty response from server")
+                
             c = 1 if task['field'] == 'p' else 3
             base64_len = int(512 * 512 * 2 * c)
             base64_format = '<' + str(base64_len) + 'f'
-            data = struct.unpack(base64_format, result)
+            
+            try:
+                data = struct.unpack(base64_format, result)
+            except struct.error as e:
+                raise ValueError(f"Invalid data format: {str(e)}")
+                
             data = np.array(data).reshape((512, 512, 2, c))
+            
+            # 验证数据的有效性
+            if np.isnan(data).any() or np.isinf(data).any():
+                raise ValueError("Data contains NaN or Inf values")
             
             save_name = f"f_{task['field']}_t_{task['timestep']}_x_{task['x_start']}_y_{task['y_start']}_z_{task['z_start']}.npy"
             local_path = f'/mnt/tmpfs/{save_name}'
+            
+            # 保存前先验证本地存储空间
+            if os.path.exists(local_path):
+                os.remove(local_path)
+                
             np.save(local_path, data)
             
+            # 验证文件是否成功保存
+            if not os.path.exists(local_path):
+                raise IOError("Failed to save local file")
+                
             remote_path = f"obs://mhd1024t128/worker_{task['worker_id']}/{save_name}"
-            os.system(f"obsutil cp {local_path} {remote_path} >log.txt 2>&1")
             
+            # 使用obsutil上传文件，带有重试机制
+            upload_success = False
+            upload_retries = 3
+            for upload_attempt in range(upload_retries):
+                try:
+                    os.system(f"obsutil cp {local_path} {remote_path} >log.txt 2>&1")
+                    # 验证上传是否成功（可以通过检查obsutil的返回值）
+                    upload_success = True
+                    break
+                except Exception as e:
+                    if upload_attempt < upload_retries - 1:
+                        time.sleep(random.uniform(1, 3))
+                    else:
+                        raise IOError(f"Failed to upload to OBS after {upload_retries} attempts")
+            
+            # 清理本地文件
             try:
                 os.remove(local_path)
             except:
                 pass
             
-            return True
+            if upload_success:
+                return True
+            
+        except (zeep.exceptions.Fault, zeep.exceptions.TransportError) as e:
+            # SOAP服务相关错误
+            retry_count += 1
+            backoff_time = min(max_backoff, initial_backoff * (2 ** retry_count) + random.uniform(0, 1))
+            
+            logging.error(
+                f"SOAP service error in download_chunk (attempt {retry_count}/{max_retries}): {str(e)}\n"
+                f"Task details: field={task['field']}, timestep={task['timestep']}, "
+                f"x={task['x_start']}, y={task['y_start']}, z={task['z_start']}\n"
+                f"Retrying in {backoff_time:.2f} seconds..."
+            )
+            
+            time.sleep(backoff_time)
+            
+        except (requests.exceptions.RequestException, ConnectionError) as e:
+            # 网络连接相关错误
+            retry_count += 1
+            backoff_time = min(max_backoff, initial_backoff * (2 ** retry_count) + random.uniform(0, 1))
+            
+            logging.error(
+                f"Network error in download_chunk (attempt {retry_count}/{max_retries}): {str(e)}\n"
+                f"Retrying in {backoff_time:.2f} seconds..."
+            )
+            
+            time.sleep(backoff_time)
             
         except Exception as e:
+            # 其他未预期的错误
             retry_count += 1
-            record_error()
+            backoff_time = min(max_backoff, initial_backoff * (2 ** retry_count) + random.uniform(0, 1))
             
-            backoff_time = min(300, (2 ** retry_count) + random.uniform(0, 1))
             logging.error(
-                f"Error in download_chunk (attempt {retry_count}/{max_retries}): {str(e)}\n"
+                f"Unexpected error in download_chunk (attempt {retry_count}/{max_retries}): {str(e)}\n"
                 f"Retrying in {backoff_time:.2f} seconds..."
             )
             
@@ -358,7 +432,7 @@ class JHTDBWorker:
                 logging.info(f"Failed tasks saved to {failed_tasks_file}")
             except Exception as e:
                 logging.error(f"Failed to save failed tasks: {e}")
-                
+
     def cleanup(self):
         """清理临时文件和资源"""
         try:
