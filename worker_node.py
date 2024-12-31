@@ -200,6 +200,37 @@ class JHTDBWorker:
             )
         except Exception as e:
             logging.error(f"Failed to update progress: {e}")
+
+    def generate_tasks(self):
+        """生成当前worker的下载任务列表，使用1-based索引"""
+        tasks = []
+        worker_id = self.config.worker_id
+        total_workers = self.config.total_workers
+        downsample_rate = 8 # for downsample timestep t
+        
+        for t in range(0, 1024, downsample_rate):  # 时间步长
+            if (t//downsample_rate) % total_workers == (worker_id - 1):  # 按worker_id分配时间步长
+                for field in ['u', 'a', 'b', 'p']:
+                    for z in range(0, 1024, 2):
+                        for x in range(0, 1024, 512):
+                            for y in range(0, 1024, 512):
+                                task = {
+                                    'timestep': t + 1,  # 1-based indexing
+                                    'field': field,
+                                    'x_start': x + 1,   # 1-based indexing
+                                    'y_start': y + 1,   # 1-based indexing
+                                    'z_start': z + 1,   # 1-based indexing
+                                    'x_end': min(x + 512, 1024),  # 确保不超过范围
+                                    'y_end': min(y + 512, 1024),
+                                    'z_end': min(z + 2, 1024),
+                                    'x_step': 1,
+                                    'y_step': 1,
+                                    'z_step': 1,
+                                    'worker_id': self.config.worker_id
+                                }
+                                tasks.append(task)
+        
+        return tasks
             
     def run(self):
         """运行worker"""
