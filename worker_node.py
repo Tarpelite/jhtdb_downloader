@@ -245,7 +245,7 @@ class JHTDBWorker:
         
         tasks = self.generate_tasks()
         remaining_tasks = [task for task in tasks 
-                         if not is_task_completed(task, completed_tasks)]
+                        if not is_task_completed(task, completed_tasks)]
         
         self.total_tasks = len(remaining_tasks)
         logging.info(f"Remaining tasks: {self.total_tasks}")
@@ -260,52 +260,105 @@ class JHTDBWorker:
                 current_batch = remaining_tasks[:batch_size]
                 remaining_tasks = remaining_tasks[batch_size:]
                 
-                with ProcessPoolExecutor(max_workers=batch_size) as executor:
-                    futures = {executor.submit(download_chunk, task): task 
-                             for task in current_batch}
-                    
-                    for future in as_completed(futures, timeout=self.average_download_time * 2 if self.average_download_time > 0 else None):
-                        task = futures[future]
-                        try:
-                            start_time = time.time()
-                            success = future.result()
-                            end_time = time.time()
-                            
-                            # 更新平均下载时间
-                            self.task_times.append(end_time - start_time)
-                            self.average_download_time = sum(self.task_times) / len(self.task_times)
-                            
-                            if success:
-                                completed_count += 1
-                                self.update_progress(completed_count, self.total_tasks)
-                                # 如果连续成功，逐渐增加批次大小
-                                if completed_count % 10 == 0:
-                                    batch_size = min(batch_size + 2, self.config.max_workers)
-                            else:
-                                failed_tasks.append(task)
-                                # 如果失败，减少批次大小
-                                batch_size = max(4, batch_size - 2)
-                        except TimeoutError:
-                            logging.error(f"Task {task} timed out after {self.average_download_time * 2:.2f} seconds")
-                            failed_tasks.append(task)
-                            batch_size = max(4, batch_size - 2)
-                        except Exception as e:
-                            logging.error(f"Task failed with error: {e}")
-                            failed_tasks.append(task)
-                            batch_size = max(4, batch_size - 2)
-                        finally:
-                            pbar.update(1)
-                            pbar.set_description(
-                                f"Completed: {completed_count}/{self.total_tasks} "
-                                f"Workers: {batch_size}"
-                            )
+                futures_completed = False
+                retry_count = 0
+                max_retries = 3
                 
-                time.sleep(1)  # 批次间暂停
-        
+                while not futures_completed and retry_count < max_retries:
+                    try:
+                        with ProcessPoolExecutor(max_workers=batch_size) as executor:
+                            futures = {executor.submit(download_chunk, task): task 
+                                    for task in current_batch}
+                            
+                            timeout = max(300, self.average_download_time * 2 if self.average_download_time > 0 else 300)
+                            
+                            # 使用as_completed带超时，但捕获异常并继续处理
+                            completed_futures = []
+                            for future in as_completed(futures, timeout=timeout):
+                                completed_futures.append(future)
+                                task = futures[future]
+                                try:
+                                    start_time = time.time()
+                                    success = future.result(timeout=30)  # 单个任务的超时时间
+                                    end_time = time.time()
+                                    
+                                    # 更新平均下载时间
+                                    self.task_times.append(end_time - start_time)
+                                    self.average_download_time = sum(self.task_times[-50:]) / min(len(self.task_times), 50)
+                                    
+                                    if success:
+                                        completed_count += 1
+                                        self.update_progress(completed_count, self.total_tasks)
+                                        # 如果连续成功，逐渐增加批次大小
+                                        if completed_count % 10 == 0:
+                                            batch_size = min(batch_size + 2, self.config.max_workers)
+                                    else:
+                                        failed_tasks.append(task)
+                                        # 如果失败，减少批次大小
+                                        batch_size = max(4, batch_size - 2)
+                                        
+                                except TimeoutError:
+                                    logging.error(f"Task {task} timed out")
+                                    failed_tasks.append(task)
+                                    batch_size = max(4, batch_size - 2)
+                                except Exception as e:
+                                    logging.error(f"Task failed with error: {e}")
+                                    failed_tasks.append(task)
+                                    batch_size = max(4, batch_size - 2)
+                                finally:
+                                    pbar.update(1)
+                                    pbar.set_description(
+                                        f"Completed: {completed_count}/{self.total_tasks} "
+                                        f"Workers: {batch_size}"
+                                    )
+                            
+                            # 检查是否所有futures都完成了
+                            if len(completed_futures) == len(futures):
+                                futures_completed = True
+                            else:
+                                # 有未完成的futures
+                                uncompleted = set(futures.keys()) - set(completed_futures)
+                                logging.warning(f"{len(uncompleted)} futures uncompleted in batch")
+                                # 将未完成的任务添加回任务队列
+                                for future in uncompleted:
+                                    task = futures[future]
+                                    failed_tasks.append(task)
+                                retry_count += 1
+                                
+                    except concurrent.futures.TimeoutError:
+                        logging.error(f"Batch timeout after {timeout} seconds")
+                        # 将整个批次添加到失败任务中
+                        failed_tasks.extend(current_batch)
+                        retry_count += 1
+                    except Exception as e:
+                        logging.error(f"Batch execution failed: {e}")
+                        failed_tasks.extend(current_batch)
+                        retry_count += 1
+                    
+                # 如果重试次数达到上限，记录错误并继续下一个批次
+                if retry_count >= max_retries:
+                    logging.error(f"Batch failed after {max_retries} retries")
+                
+                # 批次间暂停，根据成功率动态调整
+                success_rate = completed_count / (completed_count + len(failed_tasks)) if completed_count + len(failed_tasks) > 0 else 0
+                sleep_time = max(1, 5 * (1 - success_rate))  # 成功率越低，暂停时间越长
+                time.sleep(sleep_time)
+            
+            # 处理失败的任务
+            if failed_tasks:
+                logging.info(f"Processing {len(failed_tasks)} failed tasks...")
+                remaining_tasks.extend(failed_tasks)  # 将失败的任务重新添加到队列
+                
         if failed_tasks:
-            logging.error(f"Failed tasks: {len(failed_tasks)}")
-            # 可以选择重试失败的任务或将其保存到文件中
-    
+            # 保存失败的任务到文件中
+            failed_tasks_file = f"failed_tasks_worker_{self.config.worker_id}.json"
+            try:
+                with open(failed_tasks_file, 'w') as f:
+                    json.dump(failed_tasks, f)
+                logging.info(f"Failed tasks saved to {failed_tasks_file}")
+            except Exception as e:
+                logging.error(f"Failed to save failed tasks: {e}")
+                
     def cleanup(self):
         """清理临时文件和资源"""
         try:
