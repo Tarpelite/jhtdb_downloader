@@ -18,6 +18,7 @@ from datetime import datetime
 import random
 from pathlib import Path
 from tqdm import tqdm
+from concurrent.futures import as_completed, TimeoutError
 
 
 # 将速率控制移到进程级别
@@ -158,6 +159,8 @@ class JHTDBWorker:
         self.setup_directories()
         self.total_tasks = 0
         self.completed_count = 0
+        self.average_download_time = 0  # 用于存储平均下载时间
+        self.task_times = []  # 用于存储每个任务的下载时间
         
     def setup_logging(self):
         """配置日志系统"""
@@ -258,12 +261,20 @@ class JHTDBWorker:
                 remaining_tasks = remaining_tasks[batch_size:]
                 
                 with ProcessPoolExecutor(max_workers=batch_size) as executor:
-                    futures = [executor.submit(download_chunk, task) 
-                             for task in current_batch]
+                    futures = {executor.submit(download_chunk, task): task 
+                             for task in current_batch}
                     
-                    for future in concurrent.futures.as_completed(futures):
+                    for future in as_completed(futures, timeout=self.average_download_time * 2 if self.average_download_time > 0 else None):
+                        task = futures[future]
                         try:
+                            start_time = time.time()
                             success = future.result()
+                            end_time = time.time()
+                            
+                            # 更新平均下载时间
+                            self.task_times.append(end_time - start_time)
+                            self.average_download_time = sum(self.task_times) / len(self.task_times)
+                            
                             if success:
                                 completed_count += 1
                                 self.update_progress(completed_count, self.total_tasks)
@@ -271,12 +282,16 @@ class JHTDBWorker:
                                 if completed_count % 10 == 0:
                                     batch_size = min(batch_size + 2, self.config.max_workers)
                             else:
-                                failed_tasks.append(current_batch[futures.index(future)])
+                                failed_tasks.append(task)
                                 # 如果失败，减少批次大小
                                 batch_size = max(4, batch_size - 2)
+                        except TimeoutError:
+                            logging.error(f"Task {task} timed out after {self.average_download_time * 2:.2f} seconds")
+                            failed_tasks.append(task)
+                            batch_size = max(4, batch_size - 2)
                         except Exception as e:
                             logging.error(f"Task failed with error: {e}")
-                            failed_tasks.append(current_batch[futures.index(future)])
+                            failed_tasks.append(task)
                             batch_size = max(4, batch_size - 2)
                         finally:
                             pbar.update(1)
